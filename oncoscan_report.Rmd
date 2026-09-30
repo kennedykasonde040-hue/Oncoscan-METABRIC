@@ -1,0 +1,340 @@
+---
+title: "OncoScan: Mutation-Outcome Association Explorer in Breast Cancer (METABRIC)"
+author: "Kennedy Kasonde"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(ggrepel)
+```
+
+# Introduction
+
+Breast cancer is a molecularly heterogeneous disease, and mutations in key
+driver genes are known to associate with distinct clinical phenotypes and
+prognosis. This report explores somatic mutation data from the METABRIC
+cohort (Curtis et al., 2012; Pereira et al., 2016) to characterize mutation
+frequency across a curated oncogene panel and test whether mutation status
+in these genes is associated with the Nottingham Prognostic Index (NPI), a
+composite clinical score combining tumor size, grade, and nodal status.
+
+This analysis is exploratory and statistical in nature — it does not
+involve machine learning or predictive modeling. All data wrangling uses
+the `tidyverse` (`dplyr`, `stringr`, `forcats`), and all statistical
+testing uses base R with multiple-testing correction via
+`p.adjust(method = "BH")`.
+
+**Data source:** METABRIC cohort, accessed via cBioPortal
+(https://www.cbioportal.org/study/summary?id=brca_metabric).
+
+---
+
+# Data Loading and Cleaning
+
+```{r load-data}
+Data <- read_csv("data/METABRIC_RNA_Mutation.csv")
+glimpse(Data)
+```
+
+## Clinical data preparation
+
+We select the clinical variables relevant to this analysis and derive a
+triple-negative breast cancer (TNBC) status flag from receptor status
+columns. `death_from_cancer` contains blank strings rather than proper
+`NA`s in the raw export, so these are converted explicitly before further
+use.
+
+```{r clean-clinical}
+Data$death_from_cancer <- na_if(Data$death_from_cancer, "")
+
+clinical_data <- Data %>%
+  select(patient_id, age_at_diagnosis, tumor_size, tumor_stage,
+         er_status, pr_status, her2_status,
+         overall_survival_months, overall_survival, death_from_cancer,
+         nottingham_prognostic_index, mutation_count,
+         chemotherapy, hormone_therapy, radio_therapy) %>%
+  mutate(
+    triple_negative_status = case_when(
+      er_status == "Negative" & pr_status == "Negative" & her2_status == "Negative" ~ "TNBC",
+      TRUE ~ "Non-TNBC"
+    )
+  )
+
+glimpse(clinical_data)
+```
+
+## Oncogene panel definition
+
+A 15-gene panel of well-characterized breast cancer oncogenes and tumor
+suppressors was selected and verified against the dataset's column names
+before use.
+
+```{r oncogene-panel}
+oncogene_panel <- c("tp53", "brca1", "brca2", "pik3ca", "kras", "braf",
+                     "egfr", "chek2", "akt2", "cdkn2a", "gata3", "cdh1",
+                     "map3k1", "erbb2", "pten")
+
+mut_cols <- paste0(oncogene_panel, "_mut")
+stopifnot(length(setdiff(mut_cols, colnames(Data))) == 0)
+```
+
+## Mutation data reshaping
+
+Mutation columns are stored in wide format, with `"0"` indicating no
+mutation and any other value containing the protein-change annotation
+(e.g., `"R175H"`). We reshape to long format and classify each mutated
+entry by variant type using `str_detect()` on the annotation text.
+
+**Note on scope:** a small number of cells (~240 of 2,344 mutated
+instances, ~10%, concentrated in PIK3CA and MAP3K1) contain multiple
+co-occurring mutations in the same gene. These are classified by the
+first-matching pattern in the `case_when()` below rather than split into
+separate events — a documented simplification (see Limitations).
+
+```{r reshape-mutations}
+mutation_long <- Data %>%
+  select(patient_id, all_of(mut_cols)) %>%
+  pivot_longer(
+    cols = all_of(mut_cols),
+    names_to = "gene",
+    values_to = "mutation_detail"
+  ) %>%
+  mutate(
+    gene = str_remove(gene, "_mut"),
+    mutated = mutation_detail != "0",
+    mutation_type = case_when(
+      mutation_detail == "0" ~ "None",
+      str_detect(mutation_detail, "fs") ~ "Frameshift",
+      str_detect(mutation_detail, "_splice") ~ "Splice site",
+      str_detect(mutation_detail, "\\*") ~ "Nonsense",
+      str_detect(mutation_detail, "del") ~ "In-frame deletion",
+      TRUE ~ "Missense"
+    )
+  )
+```
+
+---
+
+# Results
+
+## Mutation frequency across the oncogene panel
+
+```{r gene-frequency}
+gene_freq <- mutation_long %>%
+  filter(mutated) %>%
+  count(gene, name = "n_mutated", sort = TRUE) %>%
+  mutate(
+    pct_patients = n_mutated / nrow(clinical_data) * 100,
+    gene = str_to_upper(gene)
+  )
+```
+
+```{r frequency-plot, fig.width=9, fig.height=6, fig.cap="Figure 1: Mutation frequency across the METABRIC oncogene panel."}
+ggplot(gene_freq, aes(x = fct_reorder(gene, n_mutated), y = pct_patients)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(pct_patients, 1)), hjust = -0.1) +
+  coord_flip() +
+  labs(
+    title = "Mutation Frequency Across METABRIC Oncogene Panel",
+    x = "Gene Name", y = "% of Mutated Patients",
+    caption = "Data Source: METABRIC Cohort"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "italic")
+  )
+```
+
+PIK3CA (`r round(gene_freq$pct_patients[gene_freq$gene == "PIK3CA"], 1)`%)
+and TP53 (`r round(gene_freq$pct_patients[gene_freq$gene == "TP53"], 1)`%)
+are the most frequently mutated genes in this cohort, consistent with
+published METABRIC mutation frequencies (Pereira et al., 2016). Genes such
+as KRAS, BRAF, and AKT2 show very low mutation frequency here, consistent
+with their more prominent driver role in other cancer types rather than
+breast cancer specifically.
+
+## Clinical stratification
+
+```{r clinical-plot-data}
+clinical_plot_data <- clinical_data %>%
+  filter(!is.na(tumor_stage)) %>%
+  mutate(tumor_stage = factor(tumor_stage))
+```
+
+```{r tumor-size-plot, fig.width=7, fig.height=5, fig.cap="Figure 2: Tumor size by TNBC status."}
+ggplot(clinical_plot_data, aes(x = triple_negative_status, y = tumor_size,
+                                fill = triple_negative_status)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 16, outlier.size = 1.5) +
+  labs(
+    title = "Distribution of Tumor Size by TNBC Status",
+    x = "Triple-Negative Breast Cancer (TNBC) Status", y = "Tumor Size (mm)",
+    caption = "Data Source: METABRIC Cohort"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.position = "none")
+```
+
+```{r npi-stage-plot, fig.width=7, fig.height=5, fig.cap="Figure 3: NPI across tumor stages."}
+ggplot(clinical_plot_data, aes(x = tumor_stage, y = nottingham_prognostic_index,
+                                fill = tumor_stage)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 16, outlier.size = 1.5) +
+  labs(
+    title = "Nottingham Prognostic Index (NPI) Across Tumor Stages",
+    x = "Tumor Stage", y = "Nottingham Prognostic Index (NPI)",
+    caption = "Data Source: METABRIC Cohort"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.position = "none")
+```
+
+NPI increases consistently with tumor stage from Stage 0 through Stage 3.
+Stage 4 (n = `r sum(clinical_plot_data$tumor_stage == "4")`) shows a lower
+median NPI than Stage 3; given the very small sample size at this stage,
+and that NPI does not directly incorporate metastatic spread (unlike
+overall tumor staging), this pattern should be interpreted cautiously
+rather than as a contradiction.
+
+## Statistical association: mutation status and prognostic score
+
+For each gene in the panel, patients were split into mutated vs.
+non-mutated groups and compared on NPI using Welch's t-test. Raw p-values
+were adjusted across all 15 tests using the Benjamini-Hochberg procedure
+to control the false discovery rate.
+
+```{r join-mutation-clinical}
+mutation_clinical <- mutation_long %>%
+  filter(gene %in% oncogene_panel) %>%
+  select(patient_id, gene, mutated) %>%
+  left_join(
+    clinical_data %>% select(patient_id, nottingham_prognostic_index),
+    by = "patient_id"
+  )
+```
+
+```{r gene-association-tests}
+gene_results <- mutation_clinical %>%
+  group_by(gene) %>%
+  group_modify(~ {
+    npi_mut    <- .x$nottingham_prognostic_index[.x$mutated]
+    npi_nonmut <- .x$nottingham_prognostic_index[!.x$mutated]
+
+    test_result <- tryCatch(
+      t.test(npi_mut, npi_nonmut),
+      error = function(e) NULL
+    )
+
+    if (is.null(test_result)) {
+      tibble(n_mutated = sum(.x$mutated), mean_diff = NA_real_, p_value = NA_real_)
+    } else {
+      tibble(
+        n_mutated = sum(.x$mutated),
+        mean_diff = mean(npi_mut) - mean(npi_nonmut),
+        p_value   = test_result$p.value
+      )
+    }
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+gene_results %>% arrange(p_adj)
+```
+
+```{r volcano-data}
+volcano_data <- gene_results %>%
+  mutate(
+    neg_log10_p = -log10(p_adj),
+    significant = p_adj < 0.05,
+    gene_label = str_to_upper(gene)
+  )
+```
+
+```{r volcano-plot, fig.width=10, fig.height=6, fig.cap="Figure 4: Association between oncogene mutation status and Nottingham Prognostic Index."}
+ggplot(volcano_data, aes(x = mean_diff, y = neg_log10_p, color = significant)) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text_repel(
+    data = filter(volcano_data, significant),
+    aes(label = gene_label),
+    fontface = "bold", show.legend = FALSE,
+    box.padding = 0.6, point.padding = 0.4,
+    min.segment.length = 0, segment.color = "grey40", force = 3
+  ) +
+  scale_color_manual(values = c("TRUE" = "firebrick", "FALSE" = "grey60")) +
+  labs(
+    title = "Association Between Oncogene Mutation Status and Prognostic Score",
+    subtitle = "Nottingham Prognostic Index by mutation status across 15 breast cancer oncogenes (METABRIC)",
+    x = "Mean Difference in NPI (Mutated − Non-mutated)",
+    y = expression(-log[10](adjusted~italic(p)~value)),
+    color = "Significant\n(BH-adjusted p < 0.05)",
+    caption = "Data Source: METABRIC Cohort | Benjamini-Hochberg correction applied across 15 tests"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+Of the 15 genes tested, `r sum(volcano_data$significant)` remained
+significant after BH correction: TP53, GATA3, PIK3CA, and CDH1. TP53
+mutation is associated with a *higher* NPI (mean difference =
+`r round(volcano_data$mean_diff[volcano_data$gene == "tp53"], 2)`),
+consistent with its role as a tumor suppressor whose loss is linked to
+more aggressive disease. GATA3, PIK3CA, and CDH1 mutations are each
+associated with *lower* NPI, consistent with their association with
+lower-grade, often luminal or lobular breast cancer subtypes (Curtis et
+al., 2012).
+
+It is worth noting that statistical significance here does not
+necessarily imply large clinical significance — for example, the TP53
+effect size (~0.7 points on a scale from roughly 2 to 6.7) is modest
+relative to its extremely small p-value, which is driven substantially by
+the large sample size (n = `r nrow(clinical_data)`).
+
+---
+
+# Limitations
+
+- `tumor_stage` is missing for `r sum(is.na(Data$tumor_stage))` patients
+  (~26% of the cohort); analyses using this variable reflect only the
+  staged subset.
+- `tumor_size` is missing for `r sum(is.na(Data$tumor_size))` patients.
+- Patients with multiple mutation events in the same gene (~10% of
+  mutated instances, concentrated in PIK3CA and MAP3K1) were classified
+  by a single dominant mutation type rather than split into separate
+  events.
+- Association testing uses `overall_survival_months`'s companion metric,
+  NPI, rather than time-to-event survival analysis, since the latter
+  requires handling censoring (patients still alive at last follow-up),
+  which is outside the current scope.
+- This analysis is exploratory and hypothesis-generating; it does not
+  establish causality between mutation status and prognostic score.
+
+# Future Improvements
+
+- Proper survival analysis (Kaplan-Meier, Cox proportional hazards) using
+  `overall_survival_months` with censoring handled correctly.
+- Splitting multi-mutation cells into individual variant-level rows.
+- Extending the association analysis to gene expression z-scores
+  alongside mutation status.
+- Incorporating molecular subtype (PAM50) as a covariate or stratification
+  variable.
+
+# References
+
+- Curtis, C. et al. (2012). The genomic and transcriptomic architecture of
+  2,000 breast tumours reveals novel subgroups. *Nature*, 486, 346–352.
+- Pereira, B. et al. (2016). The somatic mutation profiles of 2,433 breast
+  cancers refine their genomic and transcriptomic landscapes. *Nature
+  Communications*, 7, 11479.
+- Data accessed via cBioPortal for Cancer Genomics
+  (https://www.cbioportal.org/study/summary?id=brca_metabric).
